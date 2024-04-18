@@ -1,43 +1,54 @@
-import os
-import torch
 import argparse
-from tqdm import tqdm, trange
-from transformers import (
-    AutoConfig,
-    AutoTokenizer, 
-    AutoModelForCausalLM, 
-    AutoModelForSequenceClassification,
-    DataCollatorForSeq2Seq,
-    DataCollatorWithPadding,
-    get_linear_schedule_with_warmup,
-    set_seed,
-    TrainingArguments
-)
-from transformers.trainer_utils import EvalPrediction
-import wandb
-import evaluate
 import datetime
+import gc
 import json
 import math
+import os
+from secrets import token_bytes
+
+import evaluate
 import numpy as np
+import torch
+import wandb
+from activation_recording import apply_hooks
+from compute_metrics import compute_metrics
+from dataset import LoReftGLUEDataset, LoReftSupervisedDataset
+from datasets import Dataset
+from dyanmic_steering_intervention import DynamicSteeringIntervention
+from reftinit_helpers import (
+    dca_with_criterion_change,
+    get_conditional_activations,
+    get_unconditional_activations,
+)
+from task_config import task_config
 from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader
-from datasets import Dataset
-
-from task_config import task_config
-from dataset import LoReftGLUEDataset, LoReftSupervisedDataset
-from compute_metrics import compute_metrics
+from tqdm import tqdm
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    DataCollatorForSeq2Seq,
+    DataCollatorWithPadding,
+    LlamaForCausalLM,
+    TrainingArguments,
+    get_linear_schedule_with_warmup,
+    set_seed,
+)
+from transformers.trainer_utils import EvalPrediction
 
 from pyreft import (
+    LoreftIntervention,
+    NoreftIntervention,
+    ReftConfig,
+    ReftDataCollator,
+    ReftTrainerForCausalLM,
+    ReftTrainerForSequenceClassification,
     TaskType,
     get_reft_model,
-    ReftConfig,
-    ReftTrainerForCausalLM, 
-    ReftTrainerForSequenceClassification,
-    NoreftIntervention,
-    LoreftIntervention,
-    ReftDataCollator
 )
+from pyreft.interventions import ConsreftIntervention
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 classification_tasks = {"glue"}
@@ -95,19 +106,29 @@ def finetune(
     temperature: float,
     top_p: float,
     top_k: float,
+    do_reftinit: bool,
+    wandb_prefix: str,
+    limit_reftinit_samples: int,
+    reftinit_learned_source: bool,
     args,
 ):
     """
     Generic Representation Finetuning.
     """
-
+    UNCONDITIONAL_OFFSET = True
     assert task in {
-        "commonsense", "math", "alpaca", "instruct", "ultrafeedback", "glue", "gsm8k"
+        "commonsense",
+        "math",
+        "alpaca",
+        "instruct",
+        "ultrafeedback",
+        "glue",
+        "gsm8k",
     }
     if data_dir is not None:
         assert os.path.exists(data_dir), f"Data directory {data_dir} does not exist."
     dtype = dtype_mapping[dtype]
-    
+
     # store/log run details
     print(
         f"task: {task}, model: {model}, intervention_type: {intervention_type}, "
@@ -124,9 +145,12 @@ def finetune(
     train_dataset_str = train_dataset
     now = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
     if train_dataset is not None:
-        run_name = f"{model_str}.{task}.{train_dataset_str}.{test_split}.{now}"
+        run_name = f"{model_str}.{intervention_type}.{task}.{train_dataset_str}.{test_split}.{now}"
     else:
-        run_name = f"{model_str}.{task}.{now}"
+        run_name = f"{model_str}.{intervention_type}.{task}.{now}"
+
+    if wandb_prefix != "":
+        run_name = f"{wandb_prefix}.{run_name}"
 
     # which layers to intervene on
     if layers != "all":
@@ -153,18 +177,39 @@ def finetune(
 
     # load dataset splits
     assert task in task_config, f"Unrecognized task: {task}"
-    train_datasets = task_config[task]["train_datasets"] if train_dataset is None else [train_dataset]
+    train_datasets = (
+        task_config[task]["train_datasets"]
+        if train_dataset is None
+        else [train_dataset]
+    )
     if task == "glue":
         eval_datasets = [train_dataset]
     else:
-        eval_datasets = task_config[task]["eval_datasets"] if eval_dataset is None else [eval_dataset]
-        
-    ReftDataset = LoReftGLUEDataset if task == "glue" else LoReftSupervisedDataset 
+        eval_datasets = (
+            task_config[task]["eval_datasets"]
+            if eval_dataset is None
+            else [eval_dataset]
+        )
+
+    ReftDataset = LoReftGLUEDataset if task == "glue" else LoReftSupervisedDataset
     train_dataset = ReftDataset(
-        task, train_datasets[0] if task == "glue" else (os.path.join(data_dir, train_datasets[0]) if data_dir is not None else train_datasets[0]), 
-        tokenizer, data_split="train", seed=seed, max_n_example=max_n_train_example,
-        **{"num_interventions": len(layers), "position": position, 
-           "share_weights": share_weights}
+        task,
+        train_datasets[0]
+        if task == "glue"
+        else (
+            os.path.join(data_dir, train_datasets[0])
+            if data_dir is not None
+            else train_datasets[0]
+        ),
+        tokenizer,
+        data_split="train",
+        seed=seed,
+        max_n_example=max_n_train_example,
+        **{
+            "num_interventions": len(layers),
+            "position": position,
+            "share_weights": share_weights,
+        },
     )
     trigger_tokens = train_dataset.trigger_tokens
     num_labels = train_dataset.num_labels
@@ -175,10 +220,19 @@ def finetune(
         all_eval_datasets[eval_dataset] = {}
         for split in test_splits:
             raw_eval = ReftDataset(
-                task, eval_dataset if task == "glue" else os.path.join(data_dir, eval_dataset), 
-                tokenizer, data_split=split, seed=seed, max_n_example=max_n_eval_example,
-                **{"num_interventions": len(layers), "position": position, 
-                   "share_weights": share_weights}
+                task,
+                eval_dataset
+                if task == "glue"
+                else os.path.join(data_dir, eval_dataset),
+                tokenizer,
+                data_split=split,
+                seed=seed,
+                max_n_example=max_n_eval_example,
+                **{
+                    "num_interventions": len(layers),
+                    "position": position,
+                    "share_weights": share_weights,
+                },
             )
             all_eval_datasets[eval_dataset][split] = [raw_eval, raw_eval.raw_dataset]
     eval_datasets = all_eval_datasets
@@ -194,20 +248,30 @@ def finetune(
             in_train_n_eval_sample = len(to_split_eval_datasets) // 2
 
         new_splits = torch.utils.data.random_split(
-            to_split_eval_datasets, [len(to_split_eval_datasets)-in_train_n_eval_sample, in_train_n_eval_sample]
+            to_split_eval_datasets,
+            [
+                len(to_split_eval_datasets) - in_train_n_eval_sample,
+                in_train_n_eval_sample,
+            ],
         )
-        
+
         in_test_eval_datasets, in_train_eval_datasets = new_splits[0], new_splits[1]
         eval_datasets[train_dataset_str][test_split][0] = in_test_eval_datasets
         print("GLUE validation split (in training): ", len(in_train_eval_datasets))
-        print("GLUE validation split (testing): ", len(eval_datasets[train_dataset_str][test_split][0]))
+        print(
+            "GLUE validation split (testing): ",
+            len(eval_datasets[train_dataset_str][test_split][0]),
+        )
 
         is_regression = train_dataset_str == "stsb"
         metric = evaluate.load("glue", train_dataset_str)
+
         # You can define your custom compute_metrics function. It takes an `EvalPrediction` object (a namedtuple with a
         # predictions and label_ids field) and has to return a dictionary string to float.
         def in_training_compute_metrics(p: EvalPrediction):
-            preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+            preds = (
+                p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+            )
             preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
             result = metric.compute(predictions=preds, references=p.label_ids)
             if len(result) > 1:
@@ -217,45 +281,73 @@ def finetune(
     # load model based on task type.
     if task in classification_tasks:
         config = AutoConfig.from_pretrained(
-            model, num_labels=num_labels,
+            model,
+            num_labels=num_labels,
             finetuning_task=train_dataset_str,
             load_in_8bit=True if dtype == "float8" else False,
-            device_map=device
+            device_map=device,
         )
         # full precision loading since usually for small models
         model = AutoModelForSequenceClassification.from_pretrained(
             model,
-            config=config, # just providing the label
+            config=config,  # just providing the label
             torch_dtype=dtype if dtype != "float8" else None,
             load_in_8bit=True if dtype == "float8" else False,
-            device_map=device
+            device_map=device,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model,
             torch_dtype=dtype if dtype != "float8" else None,  # save memory
             load_in_8bit=True if dtype == "float8" else False,
-            device_map=device
+            device_map=device,
         )
         config = model.config
+
+    if do_reftinit:
+        print(model)
+
+        uncond_hooks = get_unconditional_activations(
+            model,
+            tokenizer,
+            limit_reftinit_samples,
+        )
+        print(
+            "MAX MEM AFTER UNCOND",
+            torch.cuda.max_memory_allocated(model.device) / 1024 / 1024 / 1024,
+        )
+        torch.cuda.reset_peak_memory_stats(model.device)
+
+        hooks = get_conditional_activations(
+            model,
+            tokenizer,
+            train_dataset,
+            limit_reftinit_samples,
+        )
+
+        print(
+            "MAX MEM AFTER COND",
+            torch.cuda.max_memory_allocated(model.device) / 1024 / 1024 / 1024,
+        )
+        torch.cuda.reset_peak_memory_stats(model.device)
 
     if intervention_type == "LoreftIntervention":
         intervention_type = LoreftIntervention
     elif intervention_type == "NoreftIntervention":
         intervention_type = NoreftIntervention
-        
+    elif intervention_type == "DynamicSteering":
+        intervention_type = DynamicSteeringIntervention
+    # elif intervention_type == "None":
+    # intervention_type = ConsreftIntervention
+
     # select collator based on the type
     if task in classification_tasks:
         data_collator_fn = DataCollatorWithPadding(
-            tokenizer=tokenizer,
-            padding="longest"
+            tokenizer=tokenizer, padding="longest"
         )
     else:
         data_collator_fn = DataCollatorForSeq2Seq(
-            tokenizer=tokenizer,
-            model=model,
-            label_pad_token_id=-100,
-            padding="longest"
+            tokenizer=tokenizer, model=model, label_pad_token_id=-100, padding="longest"
         )
     data_collator = ReftDataCollator(data_collator=data_collator_fn)
 
@@ -263,29 +355,46 @@ def finetune(
     intervention_dtype = torch.bfloat16 if isinstance(dtype, str) else dtype
     model_arch = model.config.architectures[0].lower()
     if model_arch in residual_stream_component_mapping:
-        representations = [{
-            "component": residual_stream_component_mapping[model_arch] % l,
-            "intervention": intervention_type(
-                embed_dim=config.hidden_size, low_rank_dimension=rank,
-                dropout=dropout, dtype=intervention_dtype, act_fn=act_fn, device=device,
-                add_bias=add_bias
-            )
-        } for l in layers]
-        task_type=TaskType.SEQ_CLS
+        representations = [
+            {
+                "component": residual_stream_component_mapping[model_arch] % l,
+                "intervention": intervention_type(
+                    embed_dim=config.hidden_size,
+                    low_rank_dimension=rank,
+                    dropout=dropout,
+                    dtype=intervention_dtype,
+                    act_fn=act_fn,
+                    device=device,
+                    add_bias=add_bias,
+                ),
+            }
+            for l in layers
+        ]
+        task_type = TaskType.SEQ_CLS
     else:
-        representations = [{
-            "layer": l, "component": "block_output",
-            "low_rank_dimension": rank,
-            "intervention": intervention_type(
-                embed_dim=config.hidden_size, low_rank_dimension=rank,
-                dropout=dropout, dtype=intervention_dtype, act_fn=act_fn, device=device,
-                add_bias=add_bias
-            )
-        } for l in layers]
-        task_type=TaskType.CAUSAL_LM
-    
+        representations = [
+            {
+                "layer": l,
+                "component": "block_output",
+                "low_rank_dimension": rank,
+                "intervention": intervention_type(
+                    embed_dim=config.hidden_size,
+                    low_rank_dimension=rank,
+                    dropout=dropout,
+                    dtype=intervention_dtype,
+                    act_fn=act_fn,
+                    device=device,
+                    add_bias=add_bias,
+                ),
+            }
+            for l in layers
+        ]
+        task_type = TaskType.CAUSAL_LM
+
     reft_config = ReftConfig(representations=representations)
-    reft_model = get_reft_model(model, reft_config, set_device=not isinstance(dtype, str))
+    reft_model = get_reft_model(
+        model, reft_config, set_device=not isinstance(dtype, str)
+    )
     reft_model.print_trainable_parameters()
 
     # for GLUE tasks, we enable gradients on the classifier head.
@@ -303,14 +412,13 @@ def finetune(
     # start wandb logging
     if is_wandb:
         run = wandb.init(
-            project=f"{wandb_proj}_{task}", 
+            project=f"{wandb_proj}_{task}",
             entity=wandb_name,
             name=run_name,
             dir=wandb_dir,
         )
         run.summary.update(vars(args))
-        wandb.log(
-            {"train/n_params": n_params})
+        wandb.log({"train/n_params": n_params})
 
     # # training args
     training_args = TrainingArguments(
@@ -325,7 +433,7 @@ def finetune(
         metric_for_best_model=metric_for_best_model if task == "glue" else None,
         load_best_model_at_end=True if task == "glue" else False,
         logging_strategy="steps",
-        save_total_limit=1, # for GLUE, it will save 2 at max.
+        save_total_limit=1,  # for GLUE, it will save 2 at max.
         logging_steps=logging_steps,
         lr_scheduler_type=schedule,
         learning_rate=lr,
@@ -336,12 +444,16 @@ def finetune(
         use_cpu=False if device == "cuda" else True,
         seed=seed,
         # until HF supports ReFT, this remains False! :)
-        remove_unused_columns=False
+        remove_unused_columns=False,
+        logging_first_step=True,
     )
 
     # make trainer
-    trainer_class = ReftTrainerForSequenceClassification \
-        if task in classification_tasks else ReftTrainerForCausalLM
+    trainer_class = (
+        ReftTrainerForSequenceClassification
+        if task in classification_tasks
+        else ReftTrainerForCausalLM
+    )
     trainer = trainer_class(
         model=reft_model,
         tokenizer=tokenizer,
@@ -351,21 +463,175 @@ def finetune(
         data_collator=data_collator,
         compute_metrics=in_training_compute_metrics if task == "glue" else None,
     )
-    with torch.inference_mode():
-        print(reft_model)
-        for sample in train_dataset:
-            print(sample)
-            model(**sample)
-        
-    
-    
+
+    print(
+        "MAX MEM BEFORE",
+        torch.cuda.max_memory_allocated(reft_model.model.device) / 1024 / 1024 / 1024,
+    )
+    torch.cuda.reset_peak_memory_stats(reft_model.model.device)
+
+    if do_reftinit:
+        with torch.no_grad():
+            assert UNCONDITIONAL_OFFSET
+
+            model_dtype, model_device = reft_model.model.dtype, reft_model.model.device
+            for i, intervention_item in enumerate(reft_model.interventions.items()):
+                hook = hooks[i]
+                uncond_hook = uncond_hooks[i]
+
+                print(intervention_item)
+                intervention = intervention_item[1][0]
+
+                flat_cond_embs = torch.stack(
+                    [
+                        token_rep
+                        for seq_rep in hook.output_captured
+                        for token_rep in seq_rep[0]
+                    ]
+                )
+
+                flat_uncond_embs = torch.stack(
+                    [
+                        token_rep
+                        for seq_rep in uncond_hook.output_captured
+                        for token_rep in seq_rep[0]
+                    ]
+                )
+
+                conditional_mean = torch.mean(flat_cond_embs, dim=0)
+                print(conditional_mean.shape)
+
+                unconditional_mean = torch.mean(flat_uncond_embs, dim=0)
+                print(unconditional_mean.shape)
+
+                rotation_matrix = (
+                    (conditional_mean - unconditional_mean)
+                    .unsqueeze(0)
+                    .to(torch.float32)
+                    .to(model_device)
+                    .T
+                )
+                print(rotation_matrix.shape, rotation_matrix)
+                print(
+                    intervention.rotate_layer.weight.shape,
+                    intervention.rotate_layer.weight.data.shape,
+                )
+
+                print(intervention.rotate_layer)
+
+                subspace_bias = torch.matmul(conditional_mean, rotation_matrix)
+                print(subspace_bias.shape, subspace_bias)
+
+                torch.nn.init.zeros_(intervention.learned_source.weight)
+                intervention.learned_source.bias.data = subspace_bias
+
+                intervention.rotate_layer.weight = rotation_matrix
+        # all_top_k_diffs = []
+        # for i in range(len(hooks)):
+        #     # print(hook.iterative_stat_tracker.running_mean)
+        #     hook = hooks[i]
+        #     uncond_hook = uncond_hooks[i]
+        #     # hook.output_captured
+
+        #     # # randomly pair activations in sets of 2 and take their difference
+        #     # paired_diffs = []
+        #     # shuffle before
+
+        #     flat_cond_embs = [
+        #         token_rep
+        #         for seq_rep in hook.output_captured
+        #         for token_rep in seq_rep[0]
+        #     ]
+
+        #     flat_uncond_embs = [
+        #         token_rep
+        #         for seq_rep in uncond_hook.output_captured
+        #         for token_rep in seq_rep[0]
+        #     ]
+        #     print("LAYER", i, "-------------------------")
+        #     top_k_diffs = dca_with_criterion_change(
+        #         torch.stack(flat_cond_embs).to(torch.float32),
+        #         torch.stack(flat_uncond_embs).to(torch.float32),
+        #         rank,
+        #     )
+        #     top_k_diffs = torch.stack(top_k_diffs).to(torch.bfloat16)
+
+        #     print(top_k_diffs)
+        #     all_top_k_diffs.append(top_k_diffs)
+        # with torch.no_grad():
+        #     assert len(reft_model.interventions) == len(hooks)
+
+        #     model_dtype, model_device = reft_model.model.dtype, reft_model.model.device
+        #     for i, intervention_item in enumerate(reft_model.interventions.items()):
+        #         # print(intervention_item)
+        #         # print(intervention_item[1])
+        #         adapter = intervention_item[1][0]
+        #         # print(adapter)
+
+        #         conditional_mean = (
+        #             hooks[i]
+        #             .iterative_stat_tracker.running_mean.to(model_dtype)
+        #             .to(model_device)
+        #         )
+        #         rotation_matrix = (
+        #             all_top_k_diffs[i]
+        #             .to(adapter.learned_source.weight.data.dtype)
+        #             .to(adapter.learned_source.weight.data.device)
+        #         )
+
+        #         # Ensure the columns of rotation_matrix are orthogonal
+        #         is_orthogonal = torch.allclose(
+        #             torch.matmul(rotation_matrix.T, rotation_matrix),
+        #             torch.eye(
+        #                 rotation_matrix.shape[1],
+        #                 device=rotation_matrix.device,
+        #                 dtype=rotation_matrix.dtype,
+        #             ),
+        #             atol=1e-6,
+        #         )
+
+        #         if not is_orthogonal:
+        #             print(
+        #                 "WARNING WARNING Columns of rotation_matrix are not orthogonal.",
+        #                 i,
+        #             )
+
+        #         subspace_bias = (
+        #             torch.matmul(conditional_mean, rotation_matrix.T)
+        #             .to(adapter.learned_source.bias.data.dtype)
+        #             .to(adapter.learned_source.bias.data.device)
+        #         )
+        #         print(subspace_bias)
+        #         print(adapter.learned_source.bias.data)
+
+    for hook in hooks:
+        del hook.output_captured
+        del hook
+    for uncondd_hook in uncond_hooks:
+        del uncondd_hook.output_captured
+        del uncondd_hook
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    # del data
+    # del inputs
+
+    # free all unnecessary memory
+    print(
+        "MAX MEM AFTER",
+        torch.cuda.max_memory_allocated(reft_model.model.device) / 1024 / 1024 / 1024,
+    )
+
+    from transformers.trainer_callback import PrinterCallback
+
+    trainer.remove_callback(PrinterCallback)
     trainer.train()
 
     # dump config
     args_dict = vars(args)
     args_dict["n_params"] = n_params
     json_file_name = f"{output_dir}/{run_name}/args.json"
-    with open(json_file_name, 'w') as json_file:
+    with open(json_file_name, "w") as json_file:
         json.dump(args_dict, json_file, indent=4)
 
     # save model
@@ -374,7 +640,7 @@ def finetune(
 
     # ensure everything is in eval mode
     reft_model.model.eval()
-    for k,v in reft_model.interventions.items():
+    for k, v in reft_model.interventions.items():
         _ = v[0].eval()
 
     print({"n_params": n_params})
@@ -383,12 +649,22 @@ def finetune(
     for dataset_name in eval_datasets:
         # split evalset into chunks
         for split, (eval_dataset, data_items) in eval_datasets[dataset_name].items():
-            
             generations, stats = compute_metrics(
-                task, dataset_name, reft_model, tokenizer, eval_dataset, data_items,
-                trigger_tokens, run_name, eval_batch_size, 
+                task,
+                dataset_name,
+                reft_model,
+                tokenizer,
+                eval_dataset,
+                data_items,
+                trigger_tokens,
+                run_name,
+                eval_batch_size,
                 data_collator if task in classification_tasks else None,
-                split, greedy_decoding, temperature, top_p, top_k
+                split,
+                greedy_decoding,
+                temperature,
+                top_p,
+                top_k,
             )
 
             # log
@@ -396,66 +672,115 @@ def finetune(
             if is_wandb:
                 wandb.log(stats)
             generations = stats if generations is None else generations
-            result_json_file_name = f"{output_dir}/{run_name}/{dataset_name}_{split}_outputs.json"
-            with open(result_json_file_name, 'w') as json_file:
+            result_json_file_name = (
+                f"{output_dir}/{run_name}/{dataset_name}_{split}_outputs.json"
+            )
+            with open(result_json_file_name, "w") as json_file:
                 json.dump(generations, json_file, indent=4)
 
     # log final eval stats
     result_json_file_name = f"{output_dir}/{run_name}/eval_results.json"
     eval_results["n_params"] = n_params
-    with open(result_json_file_name, 'w') as json_file:
+    with open(result_json_file_name, "w") as json_file:
         json.dump(eval_results, json_file, indent=4)
-        
+
 
 def main():
-    parser = argparse.ArgumentParser(description="A simple script that takes different arguments.")
-    
-    parser.add_argument('-task', '--task', type=str, default=None)
-    parser.add_argument('-data_dir', '--data_dir', type=str, default=None)
-    parser.add_argument('-train_dataset', '--train_dataset', type=str, default=None)
-    parser.add_argument('-eval_dataset', '--eval_dataset', type=str, default=None)
-    parser.add_argument('-model', '--model', type=str, help='yahma/llama-7b-hf', default='yahma/llama-7b-hf')
-    parser.add_argument('-seed', '--seed', type=int, help='42', default=42)
-    parser.add_argument('-l', '--layers', type=str, help='2;10;18;26', default='2;10;18;26')
-    parser.add_argument('-r', '--rank', type=int, help=8, default=8)
-    parser.add_argument('-p', '--position', type=str, help='f1+l1', default='f1+l1')
-    parser.add_argument('-e', '--epochs', type=int, help='1', default=1)
-    parser.add_argument('-is_wandb', '--is_wandb', action='store_true')
-    parser.add_argument('-wandb_name', '--wandb_name', type=str, default="reft")
-    parser.add_argument('-save_model', '--save_model', action='store_true')
-    parser.add_argument('-max_n_train_example', '--max_n_train_example', type=int, default=None)
-    parser.add_argument('-max_n_eval_example', '--max_n_eval_example', type=int, default=None)
+    parser = argparse.ArgumentParser(
+        description="A simple script that takes different arguments."
+    )
+
+    parser.add_argument("-task", "--task", type=str, default=None)
+    parser.add_argument("-data_dir", "--data_dir", type=str, default=None)
+    parser.add_argument("-train_dataset", "--train_dataset", type=str, default=None)
+    parser.add_argument("-eval_dataset", "--eval_dataset", type=str, default=None)
     parser.add_argument(
-        '-type', '--intervention_type', type=str, 
-        help='LoreftIntervention', default="LoreftIntervention")
-    parser.add_argument('-gradient_accumulation_steps', '--gradient_accumulation_steps', type=int, default=4)
-    parser.add_argument('-batch_size', '--batch_size', type=int, default=4)
-    parser.add_argument('-eval_batch_size', '--eval_batch_size', type=int, default=4)
-    parser.add_argument('-output_dir', '--output_dir', type=str, default="./official_results")
-    parser.add_argument('-lr', '--lr', type=float, default=5e-3)
-    parser.add_argument('-schedule', '--schedule', type=str, default='linear')
-    parser.add_argument('-wu', '--warmup_ratio', type=float, default=0.00)
-    parser.add_argument('-wd', '--weight_decay', type=float, default=0.00)
-    parser.add_argument('-dropout', '--dropout', type=float, default=0.00)
-    parser.add_argument('-act_fn', '--act_fn', type=str, default=None)
-    parser.add_argument('-add_bias', '--add_bias', action='store_true')
-    parser.add_argument('-test_split', '--test_split', type=str, default="validation")
-    parser.add_argument('-train_on_inputs', '--train_on_inputs', action='store_true')
-    parser.add_argument('-max_length', '--max_length', type=int, help=512, default=512)
-    parser.add_argument('-nt', '--use_normalized_template', action='store_true')
-    parser.add_argument('-allow_cls_grad', '--allow_cls_grad', action='store_true')
-    parser.add_argument('-metric_for_best_model', '--metric_for_best_model', type=str, default="accuracy")
-    parser.add_argument('-dtype', '--dtype', type=str, default="bfloat16" if device == "cuda" else "float32")
-    parser.add_argument('-logging_steps', '--logging_steps', type=int, help=1, default=1)
-    parser.add_argument('-wandb_dir', '--wandb_dir', type=str, default='wandb')
-    parser.add_argument('-wandb_proj', '--wandb_proj', type=str, default='MyReFT')
-    parser.add_argument('-sw', '--share_weights', action='store_true')
-    parser.add_argument('-gd', '--greedy_decoding', action='store_true')
+        "-model",
+        "--model",
+        type=str,
+        help="yahma/llama-7b-hf",
+        default="yahma/llama-7b-hf",
+    )
+    parser.add_argument("-seed", "--seed", type=int, help="42", default=42)
+    parser.add_argument(
+        "-l", "--layers", type=str, help="2;10;18;26", default="2;10;18;26"
+    )
+    parser.add_argument("-r", "--rank", type=int, help=8, default=8)
+    parser.add_argument("-p", "--position", type=str, help="f1+l1", default="f1+l1")
+    parser.add_argument("-e", "--epochs", type=int, help="1", default=1)
+    parser.add_argument("-is_wandb", "--is_wandb", action="store_true")
+    parser.add_argument(
+        "-wandb_name", "--wandb_name", type=str, default="konstantinjdobler"
+    )
+    parser.add_argument("-save_model", "--save_model", action="store_true")
+    parser.add_argument(
+        "-max_n_train_example", "--max_n_train_example", type=int, default=None
+    )
+    parser.add_argument(
+        "-max_n_eval_example", "--max_n_eval_example", type=int, default=None
+    )
+    parser.add_argument(
+        "-type",
+        "--intervention_type",
+        type=str,
+        help="LoreftIntervention",
+        default="DynamicSteering",
+    )
+    parser.add_argument(
+        "-gradient_accumulation_steps",
+        "--gradient_accumulation_steps",
+        type=int,
+        default=4,
+    )
+    parser.add_argument("-batch_size", "--batch_size", type=int, default=4)
+    parser.add_argument("-eval_batch_size", "--eval_batch_size", type=int, default=4)
+    parser.add_argument(
+        "-output_dir", "--output_dir", type=str, default="./official_results"
+    )
+    parser.add_argument("-lr", "--lr", type=float, default=5e-3)
+    parser.add_argument("-schedule", "--schedule", type=str, default="linear")
+    parser.add_argument("-wu", "--warmup_ratio", type=float, default=0.00)
+    parser.add_argument("-wd", "--weight_decay", type=float, default=0.00)
+    parser.add_argument("-dropout", "--dropout", type=float, default=0.00)
+    parser.add_argument("-act_fn", "--act_fn", type=str, default=None)
+    parser.add_argument("-add_bias", "--add_bias", action="store_true")
+    parser.add_argument("-test_split", "--test_split", type=str, default="validation")
+    parser.add_argument("-train_on_inputs", "--train_on_inputs", action="store_true")
+    parser.add_argument("-max_length", "--max_length", type=int, help=512, default=512)
+    parser.add_argument("-nt", "--use_normalized_template", action="store_true")
+    parser.add_argument("-allow_cls_grad", "--allow_cls_grad", action="store_true")
+    parser.add_argument(
+        "-metric_for_best_model",
+        "--metric_for_best_model",
+        type=str,
+        default="accuracy",
+    )
+    parser.add_argument(
+        "-dtype",
+        "--dtype",
+        type=str,
+        default="bfloat16" if device == "cuda" else "float32",
+    )
+    parser.add_argument(
+        "-logging_steps", "--logging_steps", type=int, help=1, default=1
+    )
+    parser.add_argument("-wandb_dir", "--wandb_dir", type=str, default="wandb")
+    parser.add_argument("-wandb_proj", "--wandb_proj", type=str, default="reftinit")
+    parser.add_argument("-sw", "--share_weights", action="store_true")
+    parser.add_argument("-gd", "--greedy_decoding", action="store_true")
 
     # decoding params
-    parser.add_argument('-t', '--temperature', type=float, default=None)
-    parser.add_argument('-top_p', '--top_p', type=float, default=None)
-    parser.add_argument('-top_k', '--top_k', type=float, default=None)
+    parser.add_argument("-t", "--temperature", type=float, default=None)
+    parser.add_argument("-top_p", "--top_p", type=float, default=None)
+    parser.add_argument("-top_k", "--top_k", type=float, default=None)
+
+    parser.add_argument("-do_reftinit", "--do_reftinit", action="store_true")
+    parser.add_argument("--reftinit_learned_source", action="store_true")
+
+    parser.add_argument(
+        "-limit_reftinit_samples", "--limit_reftinit_samples", type=int, default=1000
+    )
+    parser.add_argument("-wandb_prefix", "--wandb_prefix", type=str, default="")
 
     args = parser.parse_args()
 
